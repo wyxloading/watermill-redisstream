@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Rican7/retry"
-	"github.com/Rican7/retry/strategy"
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/go-redis/redis"
@@ -502,24 +501,33 @@ ResendLoop:
 		select {
 		case <-msg.Acked():
 			// deadly retry ack
-			retry.Retry(func(attempt uint) error {
-				err := h.rc.XAck(stream, h.consumerGroup, xm.ID).Err()
-				if err != nil {
-					h.logger.Error("xack fail", err, receivedMsgLogFields)
-				}
-				return err
-			}, strategy.Delay(time.Millisecond*200))
+			p := h.rc.Pipeline()
+			p.XAck(stream, h.consumerGroup, xm.ID)
 			if h.del {
-				// deadly retry del
-				retry.Retry(func(attempt uint) error {
-					err := h.rc.XDel(stream, xm.ID).Err()
-					if err != nil {
-						h.logger.Error("xdel fail", err, receivedMsgLogFields)
-					}
-					return err
-				}, strategy.Delay(time.Millisecond*200))
+				p.XDel(stream, xm.ID)
 			}
-			h.logger.Trace("Message Acked", receivedMsgLogFields)
+			err := retry.Retry(func(attempt uint) error {
+				_, err := p.Exec()
+				return err
+			}, func(attempt uint) bool {
+				if attempt != 0 {
+					time.Sleep(time.Millisecond * 100)
+				}
+				return true
+			}, func(attempt uint) bool {
+				select {
+				case <-h.closing:
+				case <-ctx.Done():
+				default:
+					return true
+				}
+				return false
+			})
+			if err != nil {
+				h.logger.Error("Message Acked fail", err, receivedMsgLogFields)
+			} else {
+				h.logger.Trace("Message Acked", receivedMsgLogFields)
+			}
 			break ResendLoop
 		case <-msg.Nacked():
 			h.logger.Trace("Message Nacked", receivedMsgLogFields)
